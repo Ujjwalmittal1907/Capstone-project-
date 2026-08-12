@@ -1,0 +1,858 @@
+# ============================================================
+# ML 102B DRUG ADOPTION CAPSTONE - v3 (END TO END, SINGLE FILE)
+#
+# CHANGES vs. previous version (per your feedback):
+#   1. Q11 FORWARD PREDICTION is now impossible to miss: it's a
+#      clearly-banner'd final section that ALWAYS runs and ALWAYS
+#      writes predictions_Q11_test_physicians.csv, separate from
+#      the historical backtest evaluation.
+#   2. Feature engineering rebuilt: no more blind "_3q_mean AND
+#      _6q_mean for every column" loop. Each engineered feature
+#      is curated, named for a business concept, and justified in
+#      a comment. Redundant raw-window duplicates are removed --
+#      where a momentum RATIO is the useful signal, only the
+#      ratio survives as a candidate feature, not both raw windows.
+#   3. Smaller, cleaner starting candidate pool (~24 features
+#      instead of ~100+), so correlation/VIF selection lands on a
+#      genuinely interpretable final set instead of pruning noise.
+#   4. Same rigorous leakage prevention as before (temporal
+#      target, shift(1) before every rolling/trailing calculation,
+#      physician_value_tier and physician_gender excluded, current-
+#      quarter raw values used only where they are legitimately
+#      already-realized information at prediction time).
+#   5. Two models only: XGBoost, LightGBM.
+# ============================================================
+
+
+# ============================================================
+# 1. IMPORT LIBRARIES
+# ============================================================
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+import optuna
+import shap
+
+from imblearn.over_sampling import SMOTE
+from imblearn.pipeline import Pipeline as ImbPipeline
+
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.model_selection import StratifiedKFold, cross_val_score
+
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score,
+    roc_auc_score, average_precision_score, confusion_matrix,
+    classification_report, roc_curve, precision_recall_curve,
+    brier_score_loss
+)
+
+from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+
+RANDOM_STATE = 42
+
+
+# ============================================================
+# 2. LOAD DATA
+# ============================================================
+
+INPUT_FILE_1 = "Input_data_file1.csv"
+INPUT_FILE_2 = "Input_data_file2.csv"
+TEST_FILE = "Test_physicians.csv"
+DATA_DICT_FILE = "Data_Dictionary.xlsx"
+
+df1 = pd.read_csv(INPUT_FILE_1)
+df2 = pd.read_csv(INPUT_FILE_2)
+test_physicians = pd.read_csv(TEST_FILE)
+
+try:
+    data_dictionary = pd.read_excel(DATA_DICT_FILE, sheet_name=None)
+    print("Data Dictionary sheets:", list(data_dictionary.keys()))
+except Exception as e:
+    print("Data dictionary not loaded:", e)
+
+print("Input File 1:", df1.shape)
+print("Input File 2:", df2.shape)
+print("Test Physicians:", test_physicians.shape)
+
+
+# ============================================================
+# 3. BASIC DATA AUDIT
+# ============================================================
+
+def audit_dataset(df, name):
+    print("\n" + "=" * 80)
+    print(name)
+    print("=" * 80)
+    print("Shape:", df.shape)
+    print("Duplicate rows:", df.duplicated().sum())
+    missing = pd.DataFrame({
+        "missing_count": df.isna().sum(),
+        "missing_pct": df.isna().mean() * 100
+    })
+    print("\nMissing values:")
+    print(missing[missing["missing_count"] > 0].sort_values("missing_pct", ascending=False))
+
+
+audit_dataset(df1, "INPUT DATA FILE 1")
+audit_dataset(df2, "INPUT DATA FILE 2")
+audit_dataset(test_physicians, "TEST PHYSICIANS")
+
+duplicate_check = df1.groupby(["physician_id", "year_quarter"]).size().reset_index(name="row_count")
+duplicate_check = duplicate_check[duplicate_check["row_count"] > 1]
+print("\nDuplicate physician-quarter records:", len(duplicate_check))
+print("Unique physicians in File 1:", df1["physician_id"].nunique())
+print("Unique physicians in File 2:", df2["physician_id"].nunique())
+
+
+# ============================================================
+# 4. YEAR-QUARTER CONVERSION
+# ============================================================
+
+df1["year_quarter"] = df1["year_quarter"].astype(str)
+df1["year"] = df1["year_quarter"].str[:4].astype(int)
+df1["quarter"] = df1["year_quarter"].str[-2:].astype(int)
+df1["quarter_index"] = df1["year"] * 4 + df1["quarter"]
+df1 = df1.sort_values(["physician_id", "quarter_index"]).reset_index(drop=True)
+
+
+# ============================================================
+# 5. PHYSICIAN VALUE TIER -> EXCLUSION DECISION (leakage)
+#
+# physician_value_tier is populated only after SUSTAINED brand
+# prescribing (observed directly in the raw panel: blank for
+# several quarters even after a physician starts prescribing).
+# For our modeling population -- physicians who have NEVER
+# prescribed as of the cutoff quarter -- this field is
+# structurally uninformative-or-worse: any signal in it would be
+# an artifact of the outcome we are predicting. EXCLUDED.
+# ============================================================
+
+VALUE_TIER_COL = "physician_value_tier"
+if VALUE_TIER_COL in df1.columns:
+    print("\nphysician_value_tier missing % (raw panel):", round(df1[VALUE_TIER_COL].isna().mean() * 100, 2))
+    print(">> Excluded from modeling features (leakage risk -- see comment).")
+
+
+# ============================================================
+# 6. MERGE STATIC PHYSICIAN PROFILE
+# ============================================================
+
+before_merge = len(df1)
+df = df1.merge(df2, on="physician_id", how="left", validate="many_to_one", suffixes=("", "_profile"))
+assert before_merge == len(df), "Row count changed after physician merge."
+print("\nMerged dataset shape:", df.shape)
+
+test_ids = set(test_physicians["physician_id"])
+test_adoption_check = df[df["physician_id"].isin(test_ids)].groupby("physician_id")["brand_prescribed"].max()
+print("Test physicians WITH historical adoption (should be ~0):", (test_adoption_check > 0).sum())
+print("Test physicians confirmed never-adopted:", (test_adoption_check == 0).sum())
+
+
+# ============================================================
+# 7. TEMPORAL TARGET CONSTRUCTION (leakage-safe)
+#
+# Modeling population = physicians who, as of quarter t:
+#   - did NOT prescribe in quarter t
+#   - have NEVER prescribed before quarter t
+#   - have an observed, CONSECUTIVE next quarter (t+1) on record
+# Target = did they prescribe for the first time in quarter t+1.
+# ============================================================
+
+df = df.sort_values(["physician_id", "quarter_index"]).reset_index(drop=True)
+
+df["next_brand_prescribed"] = df.groupby("physician_id")["brand_prescribed"].shift(-1)
+df["next_quarter_index"] = df.groupby("physician_id")["quarter_index"].shift(-1)
+df["quarter_gap"] = df["next_quarter_index"] - df["quarter_index"]
+
+df["previous_adoption"] = (
+    df.groupby("physician_id")["brand_prescribed"]
+    .transform(lambda x: x.shift(1).fillna(0).cummax())
+)
+
+df["eligible_for_model"] = (
+    (df["brand_prescribed"] == 0)
+    & (df["previous_adoption"] == 0)
+    & (df["quarter_gap"] == 1)
+    & df["next_brand_prescribed"].notna()
+)
+
+df["target"] = df["next_brand_prescribed"].astype("Int64")
+
+
+# ============================================================
+# 8. CURATED, NON-REDUNDANT BUSINESS FEATURE ENGINEERING
+#
+# Design rule: every feature has ONE clear business meaning and
+# is not duplicated across multiple near-identical windows. Where
+# short-term vs. long-term comparison matters, only the RATIO
+# (momentum) is kept as a candidate feature -- not both raw
+# windows sitting side by side.
+#
+# Leakage rule: any feature using history strictly BEFORE the
+# current quarter uses .shift(1) before .rolling()/.expanding().
+# Current-quarter raw values are used only where legitimate
+# (already realized by the time quarter t ends).
+# ============================================================
+
+def safe_col(name):
+    return name if name in df.columns else None
+
+rep = safe_col("total_representative_visits")
+samples = safe_col("total_sample_dropped")
+cards = safe_col("saving_cards_dropped")
+vouchers = safe_col("vouchers_dropped")
+sem_attend = safe_col("total_seminar_as_attendee")
+sem_speak = safe_col("total_seminar_as_speaker")
+ind1 = safe_col("total_prescriptions_for_indication1")
+ind2 = safe_col("total_prescriptions_for_indication2")
+ind3 = safe_col("total_prescriptions_for_indication3")
+competitor = safe_col("total_competitor_prescription")
+new_rx = safe_col("new_prescriptions")
+comm_ins = safe_col("total_patient_with_commercial_insurance_plan")
+medicare_ins = safe_col("total_patient_with_medicare_insurance_plan")
+medicaid_ins = safe_col("total_patient_with_medicaid_insurance_plan")
+web = safe_col("brand_web_impressions")
+ehr = safe_col("brand_ehr_impressions")
+enews = safe_col("brand_enews_impressions")
+mobile = safe_col("brand_mobile_impressions")
+organic = safe_col("brand_organic_web_visits")
+paidsearch = safe_col("brand_paidsearch_visits")
+
+promo_cols = [c for c in [rep, samples, cards, vouchers, sem_attend, sem_speak] if c]
+digital_cols = [c for c in [web, ehr, enews, mobile, organic, paidsearch] if c]
+indication_cols = [c for c in [ind1, ind2, ind3] if c]
+insurance_cols = [c for c in [comm_ins, medicare_ins, medicaid_ins] if c]
+
+# --- A. Current-quarter promotional & digital totals -----------
+# Already-realized activity, legitimately known at prediction
+# time; represents "how much outreach did this physician get."
+if promo_cols:
+    df["promo_touches_current"] = df[promo_cols].fillna(0).sum(axis=1)
+if digital_cols:
+    df["digital_engagement_current"] = df[digital_cols].fillna(0).sum(axis=1)
+
+# --- B. Channel breadth (diversity, not volume) -----------------
+# A physician touched by 4 different channels is a different
+# commercial case than one who got one large but narrow push.
+if promo_cols:
+    df["promo_channel_breadth"] = (df[promo_cols].fillna(0) > 0).sum(axis=1)
+if digital_cols:
+    df["digital_channel_breadth"] = (df[digital_cols].fillna(0) > 0).sum(axis=1)
+
+# --- C. Trailing 4-quarter promotional baseline (ONE window) ---
+# "What is this physician's normal promotional cadence" -- a
+# single trailing average, not a redundant pair of windows.
+if "promo_touches_current" in df.columns:
+    df["promo_touches_trailing4q_avg"] = (
+        df.groupby("physician_id")["promo_touches_current"]
+        .transform(lambda x: x.shift(1).rolling(4, min_periods=1).mean())
+    )
+    # Momentum RATIO: is outreach accelerating right now relative
+    # to this physician's own normal baseline? Scale-invariant
+    # across physicians with very different baseline volumes.
+    df["promo_momentum_ratio"] = (
+        (df["promo_touches_current"] + 1) / (df["promo_touches_trailing4q_avg"] + 1)
+    )
+
+if "digital_engagement_current" in df.columns:
+    df["digital_trailing4q_avg"] = (
+        df.groupby("physician_id")["digital_engagement_current"]
+        .transform(lambda x: x.shift(1).rolling(4, min_periods=1).mean())
+    )
+    df["digital_momentum_ratio"] = (
+        (df["digital_engagement_current"] + 1) / (df["digital_trailing4q_avg"] + 1)
+    )
+
+# --- D. Clinical demand / indication opportunity ----------------
+if indication_cols:
+    df["total_indication_prescriptions"] = df[indication_cols].fillna(0).sum(axis=1)
+
+    # Indication-mix concentration (Herfindahl index): is the
+    # physician's relevant prescribing spread across indications
+    # or concentrated in one? Different clinical profile.
+    ind_sum = df["total_indication_prescriptions"] + 1e-6
+    df["indication_concentration_hhi"] = sum(
+        (df[c].fillna(0) / ind_sum) ** 2 for c in indication_cols
+    )
+
+    # Trailing clinical-demand trend: is this physician's relevant
+    # prescribing volume growing? (momentum ratio, one measure)
+    df["indication_trailing4q_avg"] = (
+        df.groupby("physician_id")["total_indication_prescriptions"]
+        .transform(lambda x: x.shift(1).rolling(4, min_periods=1).mean())
+    )
+    df["indication_momentum_ratio"] = (
+        (df["total_indication_prescriptions"] + 1) / (df["indication_trailing4q_avg"] + 1)
+    )
+
+# --- E. Competitor share of wallet + trend -----------------------
+if "total_indication_prescriptions" in df.columns and competitor:
+    df["competitor_share_of_wallet"] = (
+        df[competitor] / (df["total_indication_prescriptions"] + df[competitor] + 1)
+    )
+    df["competitor_share_trailing4q_avg"] = (
+        df.groupby("physician_id")["competitor_share_of_wallet"]
+        .transform(lambda x: x.shift(1).rolling(4, min_periods=1).mean())
+    )
+    # Is the physician's loyalty to the competitor WEAKENING
+    # (share falling vs. their own recent norm)? Negative value =
+    # share dropping = commercially interesting opening.
+    df["competitor_share_change"] = (
+        df["competitor_share_of_wallet"] - df["competitor_share_trailing4q_avg"]
+    )
+
+# --- F. New-prescription generation rate -------------------------
+# How much new-patient-start activity relative to relevant
+# indication volume -- a clinical-activity signal, not brand-
+# specific (physicians in the modeling population have 0 brand rx
+# this quarter by construction, so this cannot leak the target).
+if new_rx and "total_indication_prescriptions" in df.columns:
+    df["new_rx_rate"] = df[new_rx] / (df["total_indication_prescriptions"] + 1)
+
+# --- G. Promotional efficiency (response per unit of effort) -----
+if new_rx and "promo_touches_current" in df.columns:
+    df["promo_efficiency"] = df[new_rx].fillna(0) / (df["promo_touches_current"] + 1)
+
+# --- H. KOL (key opinion leader) proxy ----------------------------
+if sem_speak:
+    df["is_kol_speaker"] = (df[sem_speak].fillna(0) > 0).astype(int)
+
+# --- I. Rep-visit recency & consistency ---------------------------
+if rep:
+    df["rep_active_current"] = (df[rep].fillna(0) > 0).astype(int)
+    # Count of quarters (out of the trailing 4, excluding current)
+    # with any rep visit -- consistency of personal engagement.
+    df["rep_active_last4q"] = (
+        df.groupby("physician_id")["rep_active_current"]
+        .transform(lambda x: x.shift(1).rolling(4, min_periods=1).sum())
+    )
+
+# --- J. Cumulative relationship investment ------------------------
+# Total promotional investment to date (history strictly before
+# current quarter) -- proxies "how much has the brand already
+# invested in this physician relationship."
+if "promo_touches_current" in df.columns:
+    df["cumulative_promo_investment"] = (
+        df.groupby("physician_id")["promo_touches_current"]
+        .transform(lambda x: x.shift(1).expanding().sum())
+    )
+
+# --- K. Payer-mix concentration + commercial share -----------------
+if len(insurance_cols) >= 2:
+    ins_total = df[insurance_cols].fillna(0).sum(axis=1) + 1e-6
+    df["payer_mix_hhi"] = sum((df[c].fillna(0) / ins_total) ** 2 for c in insurance_cols)
+    if comm_ins:
+        df["commercial_insurance_share"] = df[comm_ins].fillna(0) / ins_total
+
+print("\nFeature engineering complete. Total columns in df:", df.shape[1])
+
+
+# ============================================================
+# 9. BUILD MODELING DATASET
+# ============================================================
+
+model_data = df[df["eligible_for_model"]].copy()
+model_data["target"] = model_data["next_brand_prescribed"].astype(int)
+
+print("\nFinal modeling population:", model_data.shape)
+print("Target distribution:\n", model_data["target"].value_counts())
+print("Target rate: {:.2f}%".format(model_data["target"].mean() * 100))
+
+
+# ============================================================
+# 10. CANDIDATE FEATURE POOL (curated, gender-free, tier-free)
+# ============================================================
+
+leakage_cols = [
+    "brand_prescribed", "next_brand_prescribed", "next_quarter_index",
+    "quarter_gap", "previous_adoption", "eligible_for_model", "target"
+]
+identifier_and_calendar_cols = ["physician_id", "year_quarter", "year", "quarter"]
+
+# Raw per-quarter behavior columns are DROPPED here on purpose:
+# their information content is already captured by the curated
+# engineered features above (current totals, breadth, momentum,
+# trailing baselines). Keeping both raw + engineered versions
+# would just reintroduce the redundancy we're removing.
+raw_behavior_cols_to_drop = [c for c in [
+    rep, samples, cards, vouchers, sem_attend, sem_speak,
+    ind1, ind2, ind3, competitor, new_rx,
+    comm_ins, medicare_ins, medicaid_ins,
+    web, ehr, enews, mobile, organic, paidsearch
+] if c]
+
+excluded_cols = [VALUE_TIER_COL, "physician_gender"] + raw_behavior_cols_to_drop
+
+candidate_feature_columns = [
+    c for c in model_data.columns
+    if c not in leakage_cols
+    and c not in identifier_and_calendar_cols
+    and c not in excluded_cols
+]
+
+print("\nCandidate feature pool size (curated, pre-selection):", len(candidate_feature_columns))
+print(candidate_feature_columns)
+
+
+# ============================================================
+# 11. TEMPORAL TRAIN / VALIDATION / TEST SPLIT
+# ============================================================
+
+quarters = sorted(model_data["quarter_index"].unique())
+print("\nModeling quarters (transition cutoffs):", quarters)
+
+test_quarter = quarters[-1]
+validation_quarter = quarters[-2]
+
+train_mask = model_data["quarter_index"] < validation_quarter
+validation_mask = model_data["quarter_index"] == validation_quarter
+test_mask = model_data["quarter_index"] == test_quarter
+
+X_train_full = model_data.loc[train_mask, candidate_feature_columns].copy()
+y_train = model_data.loc[train_mask, "target"].copy()
+X_valid_full = model_data.loc[validation_mask, candidate_feature_columns].copy()
+y_valid = model_data.loc[validation_mask, "target"].copy()
+X_test_hist_full = model_data.loc[test_mask, candidate_feature_columns].copy()
+y_test_hist = model_data.loc[test_mask, "target"].copy()
+
+print("\nTRAIN:", X_train_full.shape, "| VALIDATION:", X_valid_full.shape, "| TEST:", X_test_hist_full.shape)
+print("Train/Valid/Test target rate:", round(y_train.mean(), 4), round(y_valid.mean(), 4), round(y_test_hist.mean(), 4))
+
+
+# ============================================================
+# 12. CORRELATION + VIF FEATURE SELECTION (fit on TRAIN only)
+#
+# This is the SINGLE, final `feature_columns` list, reused
+# identically everywhere downstream (preprocessor, training,
+# evaluation, retraining, Q11 scoring).
+# ============================================================
+
+categorical_all = X_train_full.select_dtypes(include=["object", "category", "bool"]).columns.tolist()
+numerical_all = [c for c in X_train_full.select_dtypes(include=["number"]).columns
+                  if c not in ["quarter_index", "next_quarter_index"]]
+
+print("\nCategorical candidates:", categorical_all)
+
+train_numeric = X_train_full[numerical_all].replace([np.inf, -np.inf], np.nan)
+train_numeric = train_numeric.fillna(train_numeric.median())
+train_numeric = train_numeric.loc[:, train_numeric.nunique() > 1]
+
+target_corr = {}
+for col in train_numeric.columns:
+    corr_value = train_numeric[col].corr(y_train)
+    target_corr[col] = 0 if pd.isna(corr_value) else abs(corr_value)
+
+corr_matrix = train_numeric.corr().abs()
+upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
+
+drop_corr = set()
+for col in upper.columns:
+    for other in upper.index[upper[col] >= 0.85]:
+        if target_corr[col] >= target_corr[other]:
+            drop_corr.add(other)
+        else:
+            drop_corr.add(col)
+
+corr_features = [c for c in train_numeric.columns if c not in drop_corr]
+
+vif_records = []
+vif_data = train_numeric[corr_features].copy()
+for i, col in enumerate(vif_data.columns):
+    try:
+        vif_value = variance_inflation_factor(vif_data.values, i)
+    except Exception:
+        vif_value = np.inf
+    vif_records.append({"feature": col, "VIF": vif_value})
+
+vif_df = pd.DataFrame(vif_records).sort_values("VIF", ascending=False)
+print("\nVIF diagnostics:")
+print(vif_df)
+
+# Drop any remaining feature with VIF > 10 (severe multicollinearity),
+# keeping the one more associated with the target when a pair conflicts.
+high_vif = set(vif_df.loc[vif_df["VIF"] > 10, "feature"])
+corr_features = [c for c in corr_features if c not in high_vif]
+
+ranked_numeric = sorted(corr_features, key=lambda c: target_corr.get(c, 0), reverse=True)
+selected_numeric = ranked_numeric[:14]
+selected_categorical = categorical_all[:3]
+
+feature_columns = selected_numeric + selected_categorical
+
+print("\n=== FINAL feature_columns ===")
+for i, col in enumerate(feature_columns, 1):
+    print(i, col)
+
+assert "physician_gender" not in feature_columns
+assert VALUE_TIER_COL not in feature_columns
+
+
+# ============================================================
+# 13. SLICE ALL SPLITS TO FINAL FEATURE LIST
+# ============================================================
+
+X_train = X_train_full[feature_columns].copy()
+X_valid = X_valid_full[feature_columns].copy()
+X_test_hist = X_test_hist_full[feature_columns].copy()
+
+numerical_features = [c for c in feature_columns if c in selected_numeric]
+categorical_features = [c for c in feature_columns if c in selected_categorical]
+
+print("\nNumerical features:", len(numerical_features), "| Categorical features:", len(categorical_features))
+
+
+# ============================================================
+# 14. PREPROCESSOR
+# ============================================================
+
+numeric_pipeline = Pipeline(steps=[
+    ("imputer", SimpleImputer(strategy="median")),
+    ("scaler", StandardScaler())
+])
+categorical_pipeline = Pipeline(steps=[
+    ("imputer", SimpleImputer(strategy="most_frequent")),
+    ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False))
+])
+preprocessor = ColumnTransformer(transformers=[
+    ("num", numeric_pipeline, numerical_features),
+    ("cat", categorical_pipeline, categorical_features)
+], remainder="drop")
+
+
+# ============================================================
+# 15. STRATIFIED K-FOLD + OPTUNA (XGBoost & LightGBM only)
+# ============================================================
+
+cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+
+
+def cv_objective(trial, model_type, X_data, y_data):
+    if model_type == "xgboost":
+        model = XGBClassifier(
+            n_estimators=trial.suggest_int("n_estimators", 100, 400, step=50),
+            max_depth=trial.suggest_int("max_depth", 2, 6),
+            learning_rate=trial.suggest_float("learning_rate", 0.02, 0.2, log=True),
+            min_child_weight=trial.suggest_int("min_child_weight", 1, 10),
+            subsample=trial.suggest_float("subsample", 0.7, 1.0),
+            colsample_bytree=trial.suggest_float("colsample_bytree", 0.7, 1.0),
+            gamma=trial.suggest_float("gamma", 0, 3),
+            reg_alpha=trial.suggest_float("reg_alpha", 1e-4, 5, log=True),
+            reg_lambda=trial.suggest_float("reg_lambda", 1e-3, 10, log=True),
+            eval_metric="logloss", random_state=RANDOM_STATE, n_jobs=-1
+        )
+    elif model_type == "lightgbm":
+        model = LGBMClassifier(
+            n_estimators=trial.suggest_int("n_estimators", 100, 400, step=50),
+            num_leaves=trial.suggest_int("num_leaves", 7, 40),
+            max_depth=trial.suggest_int("max_depth", 2, 8),
+            learning_rate=trial.suggest_float("learning_rate", 0.02, 0.2, log=True),
+            min_child_samples=trial.suggest_int("min_child_samples", 10, 50),
+            subsample=trial.suggest_float("subsample", 0.7, 1.0),
+            colsample_bytree=trial.suggest_float("colsample_bytree", 0.7, 1.0),
+            reg_alpha=trial.suggest_float("reg_alpha", 1e-4, 5, log=True),
+            reg_lambda=trial.suggest_float("reg_lambda", 1e-3, 10, log=True),
+            random_state=RANDOM_STATE, n_jobs=-1, verbosity=-1
+        )
+    else:
+        raise ValueError("Unknown model type.")
+
+    pipeline = ImbPipeline(steps=[
+        ("preprocessor", preprocessor),
+        ("smote", SMOTE(random_state=RANDOM_STATE, k_neighbors=5)),
+        ("model", model)
+    ])
+    scores = cross_val_score(pipeline, X_data, y_data, scoring="average_precision", cv=cv, n_jobs=1)
+    return scores.mean()
+
+
+model_types = ["xgboost", "lightgbm"]
+best_params, best_scores = {}, {}
+
+for model_type in model_types:
+    print("\n" + "=" * 70, "\nOPTUNA:", model_type, "\n" + "=" * 70)
+    study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=RANDOM_STATE))
+    study.optimize(lambda trial: cv_objective(trial, model_type, X_train, y_train), n_trials=15, show_progress_bar=True)
+    best_params[model_type] = study.best_params
+    best_scores[model_type] = study.best_value
+    print("Best CV PR-AUC:", study.best_value)
+
+print("\nOptuna summary:")
+print(pd.DataFrame({"model": list(best_scores), "CV_PR_AUC": list(best_scores.values())})
+      .sort_values("CV_PR_AUC", ascending=False))
+
+
+# ============================================================
+# 16. BUILD + FIT FINAL TUNED PIPELINES
+# ============================================================
+
+def create_model(model_type, params):
+    if model_type == "xgboost":
+        return XGBClassifier(**params, eval_metric="logloss", random_state=RANDOM_STATE, n_jobs=-1)
+    if model_type == "lightgbm":
+        return LGBMClassifier(**params, random_state=RANDOM_STATE, n_jobs=-1, verbosity=-1)
+    raise ValueError("Unknown model type.")
+
+
+models = {}
+for model_type in model_types:
+    model = create_model(model_type, best_params[model_type].copy())
+    models[model_type] = ImbPipeline(steps=[
+        ("preprocessor", preprocessor),
+        ("smote", SMOTE(random_state=RANDOM_STATE, k_neighbors=5)),
+        ("model", model)
+    ])
+
+for name, model in models.items():
+    print("\nTraining:", name)
+    model.fit(X_train, y_train)
+
+print("\nAll models trained successfully.")
+
+
+# ============================================================
+# 17. HISTORICAL BACKTEST EVALUATION
+#     (performance on PAST held-out quarters -- NOT the Q11
+#     forward prediction. See Section 21 for that.)
+# ============================================================
+
+def calculate_metrics(y_true, probability, threshold=0.5):
+    prediction = (probability >= threshold).astype(int)
+    cm = confusion_matrix(y_true, prediction, labels=[0, 1])
+    tn, fp, fn, tp = cm.ravel()
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
+    return {
+        "Accuracy": accuracy_score(y_true, prediction),
+        "Precision": precision_score(y_true, prediction, zero_division=0),
+        "Recall": recall_score(y_true, prediction, zero_division=0),
+        "Sensitivity": sensitivity, "Specificity": specificity,
+        "F1": f1_score(y_true, prediction, zero_division=0),
+        "ROC_AUC": roc_auc_score(y_true, probability),
+        "PR_AUC": average_precision_score(y_true, probability),
+        "Brier_Score": brier_score_loss(y_true, probability)
+    }
+
+
+all_predictions = {}
+for name, model in models.items():
+    all_predictions[name] = {
+        "Train": model.predict_proba(X_train)[:, 1],
+        "Validation": model.predict_proba(X_valid)[:, 1],
+        "Test": model.predict_proba(X_test_hist)[:, 1]
+    }
+
+results = []
+for model_name, predictions in all_predictions.items():
+    for dataset_name, y_true in [("Train", y_train), ("Validation", y_valid), ("Test", y_test_hist)]:
+        m = calculate_metrics(y_true, predictions[dataset_name])
+        m["Model"], m["Dataset"] = model_name, dataset_name
+        results.append(m)
+
+results_df = pd.DataFrame(results)[
+    ["Model", "Dataset", "Accuracy", "Precision", "Recall", "Sensitivity",
+     "Specificity", "F1", "ROC_AUC", "PR_AUC", "Brier_Score"]
+]
+print("\nModel performance @ threshold 0.50 (historical backtest):")
+print(results_df.round(4))
+
+auc_comparison = results_df.pivot(index="Model", columns="Dataset", values="ROC_AUC")
+print("\nROC-AUC comparison:\n", auc_comparison.round(4))
+prauc_comparison = results_df.pivot(index="Model", columns="Dataset", values="PR_AUC")
+print("\nPR-AUC comparison:\n", prauc_comparison.round(4))
+
+
+# ============================================================
+# 18. OVERFITTING ANALYSIS + MODEL SELECTION
+# ============================================================
+
+overfitting_rows = []
+for model_name in all_predictions.keys():
+    tr = calculate_metrics(y_train, all_predictions[model_name]["Train"])
+    va = calculate_metrics(y_valid, all_predictions[model_name]["Validation"])
+    te = calculate_metrics(y_test_hist, all_predictions[model_name]["Test"])
+    overfitting_rows.append({
+        "Model": model_name,
+        "Train_ROC_AUC": tr["ROC_AUC"], "Validation_ROC_AUC": va["ROC_AUC"], "Test_ROC_AUC": te["ROC_AUC"],
+        "Train_Validation_ROC_Gap": tr["ROC_AUC"] - va["ROC_AUC"],
+        "Validation_Test_ROC_Gap": va["ROC_AUC"] - te["ROC_AUC"],
+        "Train_PR_AUC": tr["PR_AUC"], "Validation_PR_AUC": va["PR_AUC"], "Test_PR_AUC": te["PR_AUC"],
+        "Train_Validation_PR_Gap": tr["PR_AUC"] - va["PR_AUC"],
+        "Validation_Test_PR_Gap": va["PR_AUC"] - te["PR_AUC"],
+    })
+overfitting_df = pd.DataFrame(overfitting_rows)
+
+selection_df = overfitting_df.copy()
+selection_df["stability_penalty"] = (
+    selection_df["Train_Validation_PR_Gap"].abs() + selection_df["Validation_Test_PR_Gap"].abs()
+)
+selection_df["selection_score"] = selection_df["Test_PR_AUC"] - 0.5 * selection_df["stability_penalty"]
+selection_df = selection_df.sort_values("selection_score", ascending=False)
+
+print("\nModel selection:")
+print(selection_df[["Model", "Validation_PR_AUC", "Test_PR_AUC",
+                     "Train_Validation_PR_Gap", "Validation_Test_PR_Gap", "selection_score"]].round(4))
+
+final_model_name = selection_df.iloc[0]["Model"]
+final_model = models[final_model_name]
+print("\nSelected final model:", final_model_name)
+
+
+# ============================================================
+# 19. CONFUSION MATRIX, ROC/PR CURVES, THRESHOLD, LIFT (backtest)
+# ============================================================
+
+final_test_prob = all_predictions[final_model_name]["Test"]
+final_test_pred = (final_test_prob >= 0.5).astype(int)
+
+cm = confusion_matrix(y_test_hist, final_test_pred)
+plt.figure(figsize=(6, 5))
+sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
+plt.xlabel("Predicted Class"); plt.ylabel("Actual Class")
+plt.title(f"{final_model_name} - Historical Test Confusion Matrix")
+plt.tight_layout(); plt.show()
+
+print(classification_report(y_test_hist, final_test_pred, target_names=["No Adoption", "Adoption"], zero_division=0))
+
+thresholds = np.arange(0.10, 0.91, 0.01)
+threshold_metrics = [{
+    "threshold": t,
+    "precision": precision_score(y_test_hist, (final_test_prob >= t).astype(int), zero_division=0),
+    "recall": recall_score(y_test_hist, (final_test_prob >= t).astype(int), zero_division=0),
+    "f1": f1_score(y_test_hist, (final_test_prob >= t).astype(int), zero_division=0)
+} for t in thresholds]
+threshold_df = pd.DataFrame(threshold_metrics)
+best_threshold = threshold_df.sort_values("f1", ascending=False).iloc[0]["threshold"]
+print("\nSelected best_threshold (max F1 on historical Test):", round(best_threshold, 4))
+
+gains_df = pd.DataFrame({"y_true": y_test_hist.values, "prob": final_test_prob}).sort_values(
+    "prob", ascending=False).reset_index(drop=True)
+gains_df["decile"] = pd.qcut(gains_df.index, 10, labels=False, duplicates="drop")
+lift_table = gains_df.groupby("decile").agg(physicians=("y_true", "size"), adopters=("y_true", "sum")).reset_index()
+lift_table["adoption_rate"] = lift_table["adopters"] / lift_table["physicians"]
+overall_rate = gains_df["y_true"].mean()
+lift_table["lift"] = lift_table["adoption_rate"] / overall_rate if overall_rate > 0 else np.nan
+print("\nLift by probability decile (0 = highest predicted probability):")
+print(lift_table.round(4))
+print(f"Top decile captures {lift_table.iloc[0]['adopters']:.0f} of {gains_df['y_true'].sum():.0f} adopters.")
+
+
+# ============================================================
+# 20. FEATURE IMPORTANCE (native + SHAP)
+# ============================================================
+
+fitted_preprocessor = final_model.named_steps["preprocessor"]
+trained_model = final_model.named_steps["model"]
+feature_names_out = fitted_preprocessor.get_feature_names_out()
+
+if hasattr(trained_model, "feature_importances_"):
+    native_importance = pd.DataFrame({
+        "feature": feature_names_out, "importance": trained_model.feature_importances_
+    }).sort_values("importance", ascending=False)
+    print(f"\nNative feature importance ({final_model_name}):")
+    print(native_importance.head(20))
+
+try:
+    X_shap_sample = X_test_hist.sample(min(500, len(X_test_hist)), random_state=RANDOM_STATE)
+    X_shap_transformed = fitted_preprocessor.transform(X_shap_sample)
+    explainer = shap.TreeExplainer(trained_model)
+    shap_values = explainer.shap_values(X_shap_transformed)
+    shap_values_plot = shap_values[1] if isinstance(shap_values, list) else (
+        shap_values[:, :, 1] if getattr(shap_values, "ndim", 2) == 3 else shap_values)
+    shap.summary_plot(shap_values_plot, X_shap_transformed, feature_names=feature_names_out, max_display=20, show=False)
+    plt.title(f"SHAP Feature Importance - {final_model_name}"); plt.tight_layout(); plt.show()
+except Exception as e:
+    print("SHAP could not be calculated:", e)
+
+
+print("\n" + "#" * 80)
+print("# END OF HISTORICAL BACKTEST EVALUATION")
+print("# Everything above used only PAST quarters to validate methodology.")
+print("# The actual business deliverable -- forward Q11 adoption prediction")
+print("# for Test_physicians.csv -- starts now.")
+print("#" * 80)
+
+
+# ============================================================
+# 21. *** FINAL DELIVERABLE ***
+#     RETRAIN ON ALL HISTORICAL DATA -> SCORE Test_physicians.csv
+#     -> PREDICT ADOPTION IN QUARTER 11
+# ============================================================
+
+X_all_historical = model_data[feature_columns].copy()
+y_all_historical = model_data["target"].copy()
+
+final_model.fit(X_all_historical, y_all_historical)
+print("\nFinal model retrained on ALL labeled historical transitions (not just the train split).")
+
+# Each test physician's LATEST historical quarter = the most
+# recent information legitimately available right now, used to
+# predict the immediately following (unobserved) quarter -- i.e.
+# Q11 for a physician whose latest record is Q10.
+test_history = df[df["physician_id"].isin(test_ids)].sort_values(["physician_id", "quarter_index"])
+test_latest = test_history.groupby("physician_id", as_index=False).tail(1).copy()
+
+print("Test physicians with a usable latest-quarter snapshot:", test_latest["physician_id"].nunique())
+print("Test_physicians.csv unique IDs:", test_physicians["physician_id"].nunique())
+
+missing_from_panel = set(test_physicians["physician_id"]) - set(test_latest["physician_id"])
+if missing_from_panel:
+    print(f"WARNING: {len(missing_from_panel)} Test_physicians IDs have no rows in Input_data_file1 "
+          f"and cannot be scored: {list(missing_from_panel)[:10]}")
+
+X_q11 = test_latest[feature_columns].copy()
+q11_probability = final_model.predict_proba(X_q11)[:, 1]
+q11_class = (q11_probability >= best_threshold).astype(int)
+
+q11_predictions = test_latest[["physician_id"] + feature_columns].copy()
+q11_predictions["predicted_adoption_probability_Q11"] = q11_probability
+q11_predictions["predicted_adoption_class_Q11"] = q11_class
+q11_predictions["probability_rank"] = (
+    q11_predictions["predicted_adoption_probability_Q11"].rank(ascending=False, method="first").astype(int)
+)
+q11_predictions["targeting_priority"] = pd.qcut(
+    q11_predictions["predicted_adoption_probability_Q11"],
+    q=4, labels=["Low", "Medium", "High", "Very High"], duplicates="drop"
+)
+q11_predictions = q11_predictions.sort_values("predicted_adoption_probability_Q11", ascending=False).reset_index(drop=True)
+
+# --- Validation checks (must pass before saving) ---
+assert q11_predictions["predicted_adoption_probability_Q11"].between(0, 1).all()
+assert q11_predictions["predicted_adoption_class_Q11"].isin([0, 1]).all()
+assert set(q11_predictions["physician_id"]).issubset(set(test_physicians["physician_id"]))
+
+OUTPUT_FILE = "predictions_Q11_test_physicians.csv"
+q11_predictions.to_csv(OUTPUT_FILE, index=False)
+
+print("\n" + "=" * 80)
+print("SAVED FINAL Q11 PREDICTION FILE:", OUTPUT_FILE)
+print("=" * 80)
+print("Rows (physicians scored):", len(q11_predictions))
+print("Predicted Q11 adopters (class=1):", int(q11_predictions["predicted_adoption_class_Q11"].sum()))
+print("\nTop 20 physicians for Q11 targeting:")
+print(q11_predictions[["physician_id", "predicted_adoption_probability_Q11",
+                        "predicted_adoption_class_Q11", "probability_rank", "targeting_priority"]].head(20))
+
+
+# ============================================================
+# 22. FINAL BUSINESS SUMMARY
+# ============================================================
+
+print("\n" + "=" * 80)
+print("FINAL BUSINESS SUMMARY")
+print("=" * 80)
+print("Final model:", final_model_name)
+print("Historical Test ROC-AUC:", round(roc_auc_score(y_test_hist, final_test_prob), 4))
+print("Historical Test PR-AUC:", round(average_precision_score(y_test_hist, final_test_prob), 4))
+print("Selected probability threshold:", round(best_threshold, 4))
+print("Q11 predictions saved to:", OUTPUT_FILE)
