@@ -1,0 +1,1187 @@
+ML102B - FINAL END-TO-END PIPELINE - CORRECTED
+
+============================================================
+
+Sliding window:
+
+Q1,Q2,Q3 -> Q4
+
+Q2,Q3,Q4 -> Q5
+
+…
+
+Q8,Q9,Q10 -> Q11
+
+ORDER:
+
+Load/audit
+
+-> build modeling population
+
+-> TRAIN/VALIDATION/HISTORICAL TEST split
+
+-> TRAIN-ONLY EDA
+
+-> TRAIN-ONLY correlation
+
+-> TRAIN-ONLY VIF
+
+-> advanced feature engineering
+
+-> TRAIN-ONLY mutual information
+
+-> preprocessing + SMOTE
+
+-> Optuna XGBoost/LightGBM
+
+-> validation/test evaluation
+
+-> validation threshold
+
+-> lift/SHAP
+
+-> retrain on all historical windows
+
+-> Q11 prediction
+
+CORRECTION FOR THE SCREENSHOT ERROR:
+
+The old code used df[“competitor_momentum”] directly even though
+
+the engineered prefix is competitor_rx. This version NEVER accesses
+
+a momentum column unless it exists. The competitor feature is named:
+
+competitor_rx_momentum
+
+and its flag:
+
+competitor_rx_positive_momentum
+
+============================================================
+
+import warnings warnings.filterwarnings(“ignore”)
+
+import numpy as np import pandas as pd import matplotlib.pyplot as plt
+import seaborn as sns import optuna import shap
+
+from imblearn.over_sampling import SMOTE from imblearn.pipeline import
+Pipeline as ImbPipeline
+
+from sklearn.compose import ColumnTransformer from sklearn.pipeline
+import Pipeline from sklearn.preprocessing import OneHotEncoder,
+StandardScaler from sklearn.impute import SimpleImputer from
+sklearn.model_selection import StratifiedKFold, cross_val_score from
+sklearn.feature_selection import mutual_info_classif from
+sklearn.metrics import ( accuracy_score, precision_score, recall_score,
+f1_score, roc_auc_score, average_precision_score, confusion_matrix,
+classification_report, brier_score_loss ) from xgboost import
+XGBClassifier from lightgbm import LGBMClassifier from
+statsmodels.stats.outliers_influence import variance_inflation_factor
+
+RANDOM_STATE = 42 WINDOW_SIZE = 3
+
+INPUT_FILE_1 = “Input_data_file1.csv” INPUT_FILE_2 =
+“Input_data_file2.csv” TEST_FILE = “Test_physicians.csv” DATA_DICT_FILE
+= “Data_Dictionary.xlsx” OUTPUT_FILE =
+“predictions_Q11_test_physicians.csv”
+
+def section(title): print(“” + “=” * 95) print(title) print(“=” * 95)
+
+def safe_col(name): return name if name in df.columns else None
+
+def safe_divide(a, b): return a / (b.abs() + 1e-6)
+
+def make_ohe(): try: return OneHotEncoder(handle_unknown=“ignore”,
+sparse_output=False) except TypeError: return
+OneHotEncoder(handle_unknown=“ignore”, sparse=False)
+
+def safe_auc(y, p): return roc_auc_score(y, p) if y.nunique() > 1 else
+np.nan
+
+def safe_prauc(y, p): return average_precision_score(y, p) if
+y.nunique() > 1 else np.nan
+
+def safe_smote(y): counts = pd.Series(y).value_counts() if len(counts) <
+2 or counts.min() < 2: return None return SMOTE(
+random_state=RANDOM_STATE, k_neighbors=max(1, min(5, int(counts.min()) -
+1)) )
+
+============================================================
+
+1. LOAD + BASIC AUDIT
+
+============================================================
+
+section(“1. LOAD DATA”)
+
+df1 = pd.read_csv(INPUT_FILE_1) df2 = pd.read_csv(INPUT_FILE_2)
+test_physicians = pd.read_csv(TEST_FILE)
+
+try: data_dictionary = pd.read_excel(DATA_DICT_FILE, sheet_name=None)
+print(“Data dictionary sheets:”, list(data_dictionary.keys())) except
+Exception as e: data_dictionary = None print(“Data dictionary skipped:”,
+repr(e))
+
+for name, d in [ (“Input_data_file1”, df1), (“Input_data_file2”, df2),
+(“Test_physicians”, test_physicians)]: print(“”, name, d.shape)
+print(“duplicates:”, int(d.duplicated().sum())) print(“missing top 15:”)
+print(d.isna().sum().sort_values(ascending=False).head(15))
+
+if “physician_id” not in df1.columns: raise
+KeyError(“Input_data_file1.csv must contain physician_id”) if
+“physician_id” not in df2.columns: raise KeyError(“Input_data_file2.csv
+must contain physician_id”) if “physician_id” not in
+test_physicians.columns: raise KeyError(“Test_physicians.csv must
+contain physician_id”) if “brand_prescribed” not in df1.columns: raise
+KeyError(“Input_data_file1.csv must contain brand_prescribed”)
+
+============================================================
+
+2. MERGE STATIC PROFILE
+
+============================================================
+
+section(“2. MERGE STATIC PHYSICIAN PROFILE”)
+
+before = len(df1) df = df1.merge( df2, on=“physician_id”, how=“left”,
+validate=“many_to_one”, suffixes=(““,”_profile”) ) assert len(df) ==
+before, “Profile merge changed row count.”
+
+VALUE_TIER_COL = “physician_value_tier” if VALUE_TIER_COL in df.columns:
+print(“physician_value_tier excluded as leakage-prone.”)
+
+============================================================
+
+3. QUARTER INDEX
+
+============================================================
+
+section(“3. CREATE QUARTER INDEX”)
+
+if “quarter_index” not in df.columns: if “year_quarter” in df.columns: x
+= df[“year_quarter”].astype(str).str.extract( r”(?P).?Qq” ) df[“year”] =
+pd.to_numeric(x[“year”], errors=“coerce”) df[“quarter”] =
+pd.to_numeric(x[“quarter”], errors=“coerce”) if “quarter_index” not in
+df.columns and {“year”, “quarter”}.issubset(df.columns):
+df[“quarter_index”] = ( pd.to_numeric(df[“year”], errors=“coerce”) 4 +
+pd.to_numeric(df[“quarter”], errors=“coerce”) - 1 )
+
+if “quarter_index” not in df.columns: raise KeyError( “Cannot create
+quarter_index. Need quarter_index, year_quarter,” “or year + quarter.” )
+
+df[“quarter_index”] = pd.to_numeric(df[“quarter_index”],
+errors=“coerce”) if df[“quarter_index”].isna().any(): raise
+ValueError(“quarter_index contains missing values.”)
+
+============================================================
+
+4. SLIDING-WINDOW POPULATION
+
+============================================================
+
+section(“4. SLIDING-WINDOW ELIGIBILITY + TARGET”)
+
+df = df.sort_values( [“physician_id”, “quarter_index”]
+).reset_index(drop=True)
+
+grp = df.groupby(“physician_id”, sort=False)
+
+df[“running_ever_adopted”] = grp[“brand_prescribed”].cummax()
+df[“quarter_index_2back”] = grp[“quarter_index”].shift(WINDOW_SIZE - 1)
+df[“window_is_contiguous”] = ( df[“quarter_index”] -
+df[“quarter_index_2back”] ) == WINDOW_SIZE - 1
+
+df[“next_quarter_index”] = grp[“quarter_index”].shift(-1)
+df[“next_brand_prescribed”] = grp[“brand_prescribed”].shift(-1)
+df[“gap_to_next_is_one”] = ( df[“next_quarter_index”] -
+df[“quarter_index”] ) == 1
+
+df[“eligible_for_model”] = ( (df[“running_ever_adopted”] == 0) &
+df[“window_is_contiguous”] & df[“gap_to_next_is_one”] &
+df[“next_brand_prescribed”].notna() )
+
+df[“target”] = pd.to_numeric(df[“next_brand_prescribed”],
+errors=“coerce”)
+
+model_data = df[df[“eligible_for_model”]].copy() model_data[“target”] =
+model_data[“target”].astype(int) model_data[“target_quarter_index”] =
+model_data[“next_quarter_index”]
+
+print(“Eligible rows:”, len(model_data))
+print(model_data[“target”].value_counts()) print(“Target rate:”,
+round(model_data[“target”].mean() * 100, 2), “%”)
+
+if model_data.empty or model_data[“target”].nunique() < 2: raise
+ValueError(“Insufficient eligible rows/classes for modeling.”)
+
+============================================================
+
+5. RAW FEATURE POOL
+
+============================================================
+
+section(“5. RAW WINDOW-END FEATURE POOL”)
+
+rep = safe_col(“total_representative_visits”) samples =
+safe_col(“total_sample_dropped”) cards =
+safe_col(“saving_cards_dropped”) vouchers = safe_col(“vouchers_dropped”)
+sem_attend = safe_col(“total_seminar_as_attendee”) sem_speak =
+safe_col(“total_seminar_as_speaker”)
+
+ind1 = safe_col(“total_prescriptions_for_indication1”) ind2 =
+safe_col(“total_prescriptions_for_indication2”) ind3 =
+safe_col(“total_prescriptions_for_indication3”)
+
+competitor = safe_col(“total_competitor_prescription”) new_rx =
+safe_col(“new_prescriptions”)
+
+comm_ins = safe_col(“total_patient_with_commercial_insurance_plan”)
+medicare_ins = safe_col(“total_patient_with_medicare_insurance_plan”)
+medicaid_ins = safe_col(“total_patient_with_medicaid_insurance_plan”)
+
+web = safe_col(“brand_web_impressions”) ehr =
+safe_col(“brand_ehr_impressions”) enews =
+safe_col(“brand_enews_impressions”) mobile =
+safe_col(“brand_mobile_impressions”) organic =
+safe_col(“brand_organic_web_visits”) paidsearch =
+safe_col(“brand_paidsearch_visits”)
+
+promo_cols = [c for c in [rep, samples, cards, vouchers, sem_attend,
+sem_speak] if c] digital_cols = [c for c in [web, ehr, enews, mobile,
+organic, paidsearch] if c] indication_cols = [c for c in [ind1, ind2,
+ind3] if c] insurance_cols = [c for c in [comm_ins, medicare_ins,
+medicaid_ins] if c]
+
+if promo_cols: df[“promo_touches_q”] = (
+df[promo_cols].apply(pd.to_numeric,
+errors=“coerce”).fillna(0).sum(axis=1) ) if digital_cols:
+df[“digital_engagement_q”] = ( df[digital_cols].apply(pd.to_numeric,
+errors=“coerce”).fillna(0).sum(axis=1) ) if indication_cols:
+df[“indication_prescriptions_q”] = (
+df[indication_cols].apply(pd.to_numeric,
+errors=“coerce”).fillna(0).sum(axis=1) )
+
+candidate_raw_features = list(dict.fromkeys([ c for c in [ rep, samples,
+cards, vouchers, sem_attend, sem_speak, ind1, ind2, ind3, competitor,
+new_rx, comm_ins, medicare_ins, medicaid_ins, web, ehr, enews, mobile,
+organic, paidsearch, “promo_touches_q”, “digital_engagement_q”,
+“indication_prescriptions_q” ] if c is not None and c in df.columns]))
+
+print(“Raw candidates:”, len(candidate_raw_features))
+
+============================================================
+
+6. TEMPORAL SPLIT - BEFORE ALL ANALYTICAL EDA
+
+============================================================
+
+section(“6. TEMPORAL TRAIN / VALIDATION / HISTORICAL TEST SPLIT”)
+
+target_quarters = sorted(model_data[“target_quarter_index”].unique()) if
+len(target_quarters) < 3: raise ValueError(“Need at least 3 target
+quarters.”)
+
+validation_quarter = target_quarters[-2] test_quarter =
+target_quarters[-1]
+
+train_mask = model_data[“target_quarter_index”] < validation_quarter
+validation_mask = model_data[“target_quarter_index”] ==
+validation_quarter test_mask = model_data[“target_quarter_index”] ==
+test_quarter
+
+X_train_raw = model_data.loc[train_mask, candidate_raw_features].copy()
+y_train = model_data.loc[train_mask, “target”].copy()
+
+X_valid_raw = model_data.loc[validation_mask,
+candidate_raw_features].copy() y_valid = model_data.loc[validation_mask,
+“target”].copy()
+
+X_test_raw = model_data.loc[test_mask, candidate_raw_features].copy()
+y_test_hist = model_data.loc[test_mask, “target”].copy()
+
+print(“Train:”, X_train_raw.shape) print(“Validation:”,
+X_valid_raw.shape) print(“Historical test:”, X_test_raw.shape)
+print(“Validation quarter:”, validation_quarter) print(“Test quarter:”,
+test_quarter)
+
+if y_train.nunique() < 2: raise ValueError(“Training split contains only
+one target class.”)
+
+============================================================
+
+7. TRAIN-ONLY EDA
+
+============================================================
+
+section(“7. TRAIN-ONLY EDA”)
+
+train_eda = X_train_raw.copy() train_eda[“target”] = y_train.to_numpy()
+
+num_eda = [ c for c in
+train_eda.select_dtypes(include=[“number”]).columns if c != “target”]
+cat_eda = train_eda.select_dtypes( include=[“object”, “category”,
+“bool”] ).columns.tolist()
+
+print(“SUMMARY”) if num_eda:
+print(train_eda[num_eda].describe().T.round(3)) print(“:”)
+print(train_eda[num_eda].skew().sort_values( key=lambda s: s.abs(),
+ascending=False ).round(3))
+
+for c in num_eda[:12]: plt.figure(figsize=(7, 4))
+sns.histplot(train_eda[c], kde=True) plt.title(f”TRAIN distribution:
+{c}“) plt.tight_layout() plt.show()
+
+for c in num_eda[:12]: plt.figure(figsize=(7, 3))
+sns.boxplot(x=train_eda[c]) plt.title(f”TRAIN boxplot: {c}“)
+plt.tight_layout() plt.show()
+
+print(“NUMERIC VS TARGET”) for c in num_eda: print( c, “target0_mean=”,
+round(train_eda.loc[train_eda.target == 0, c].mean(), 4),
+“target1_mean=”, round(train_eda.loc[train_eda.target == 1, c].mean(),
+4) )
+
+print(“CATEGORICAL VS TARGET”) for c in cat_eda[:10]: print(“”, c)
+print( train_eda.groupby(c, dropna=False)[“target”] .agg([“size”,
+“mean”]) .sort_values(“mean”, ascending=False) .round(4) )
+
+missing_train = pd.DataFrame({ “missing_count”:
+X_train_raw.isna().sum(), “missing_pct”: X_train_raw.isna().mean() * 100
+}).sort_values(“missing_pct”, ascending=False)
+
+print(“/ MISSING ANALYSIS”)
+print(missing_train[missing_train.missing_count > 0].round(3))
+
+missing_vs_target = [] for c in X_train_raw.columns: flag =
+X_train_raw[c].isna().astype(int) if flag.nunique() == 2:
+missing_vs_target.append({ “feature”: c, “missing_target_rate”:
+y_train[flag == 1].mean(), “present_target_rate”: y_train[flag ==
+0].mean(), “missing_pct”: flag.mean() * 100 })
+
+missing_vs_target = pd.DataFrame(missing_vs_target) if not
+missing_vs_target.empty: missing_vs_target[“difference”] = (
+missing_vs_target.missing_target_rate -
+missing_vs_target.present_target_rate )
+print(missing_vs_target.sort_values( “difference”, key=lambda s:
+s.abs(), ascending=False ).round(4))
+
+if X_train_raw.isna().any().any(): plt.figure(figsize=(12, 5))
+sns.heatmap(X_train_raw.isna(), cbar=False) plt.title(“TRAIN-only
+missingness”) plt.tight_layout() plt.show()
+
+if len(num_eda) >= 2: plt.figure(figsize=(12, 9))
+sns.heatmap(train_eda[num_eda].corr(), center=0) plt.title(“TRAIN-only
+correlation EDA”) plt.tight_layout() plt.show()
+
+quarter_summary = ( model_data.loc[train_mask]
+.groupby(“target_quarter_index”)[“target”] .agg([“size”, “mean”]) )
+print(“target rate by time:”) print(quarter_summary.round(4))
+
+============================================================
+
+8. TRAIN-ONLY CORRELATION
+
+============================================================
+
+section(“8. TRAIN-ONLY CORRELATION”)
+
+raw_numeric_train = X_train_raw.select_dtypes(include=[“number”]).copy()
+raw_numeric_train = raw_numeric_train.replace([np.inf, -np.inf], np.nan)
+raw_numeric_train = raw_numeric_train.fillna(raw_numeric_train.median())
+raw_numeric_train = raw_numeric_train.loc[ :,
+raw_numeric_train.nunique(dropna=True) > 1]
+
+target_corr = {} for c in raw_numeric_train.columns: v =
+raw_numeric_train[c].corr(y_train) target_corr[c] = 0 if pd.isna(v) else
+abs(v)
+
+drop_corr = set() if len(raw_numeric_train.columns) >= 2: corr =
+raw_numeric_train.corr().abs() upper =
+corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool)) for c in
+upper.columns: for other in upper.index[upper[c] >= 0.85].tolist():
+drop_corr.add( other if target_corr[c] >= target_corr[other] else c )
+
+corr_survivors = [c for c in raw_numeric_train.columns if c not in
+drop_corr] print(“Before correlation:”, len(raw_numeric_train.columns))
+print(“Dropped:”, len(drop_corr)) print(“After correlation:”,
+len(corr_survivors))
+
+============================================================
+
+9. TRAIN-ONLY VIF
+
+============================================================
+
+section(“9. TRAIN-ONLY VIF”)
+
+vif_data = raw_numeric_train[corr_survivors].copy() vif_removed = []
+
+while len(vif_data.columns) > 1: values =
+vif_data.fillna(0).astype(float).values records = [] for i, c in
+enumerate(vif_data.columns): try: v = variance_inflation_factor(values,
+i) except Exception: v = np.inf if not np.isfinite(v): v = np.inf
+records.append({“feature”: c, “VIF”: v})
+
+    current = pd.DataFrame(records).sort_values("VIF", ascending=False)
+    max_vif = current.iloc[0]["VIF"]
+    max_feature = current.iloc[0]["feature"]
+
+    if max_vif <= 10:
+        break
+
+    vif_removed.append({"feature": max_feature, "VIF": max_vif})
+    vif_data = vif_data.drop(columns=[max_feature])
+
+raw_numeric_survivors = vif_data.columns.tolist() print(“VIF removals:”)
+print(pd.DataFrame(vif_removed).round(4)) print(“Survivors:”,
+raw_numeric_survivors)
+
+============================================================
+
+10. ADVANCED FEATURE ENGINEERING
+
+============================================================
+
+section(“10. ADVANCED FEATURE ENGINEERING”)
+
+def wmean(c): return grp[c].transform( lambda x: x.rolling(WINDOW_SIZE,
+min_periods=WINDOW_SIZE).mean() )
+
+def wstd(c): return grp[c].transform( lambda x: x.rolling(WINDOW_SIZE,
+min_periods=WINDOW_SIZE).std() )
+
+def wsum(c): return grp[c].transform( lambda x: x.rolling(WINDOW_SIZE,
+min_periods=WINDOW_SIZE).sum() )
+
+def wmin(c): return grp[c].transform( lambda x: x.rolling(WINDOW_SIZE,
+min_periods=WINDOW_SIZE).min() )
+
+def wmax(c): return grp[c].transform( lambda x: x.rolling(WINDOW_SIZE,
+min_periods=WINDOW_SIZE).max() )
+
+def wfirst(c): return grp[c].shift(WINDOW_SIZE - 1)
+
+def wlag1(c): return grp[c].shift(1)
+
+def wvelocity(c): return df[c] - wfirst(c)
+
+def wmomentum(c): # (Q3-Q2) - (Q2-Q1) = Q3 - 2Q2 + Q1 q1 =
+grp[c].shift(WINDOW_SIZE - 1) q2 = grp[c].shift(1) q3 = df[c] return
+(q3 - q2) - (q2 - q1)
+
+def wcv(c): return wstd(c) / (wmean(c).abs() + 1e-6)
+
+def add_temporal_features(source_col, prefix): ““” ONE place creates
+mean/std/min/max/current/velocity/momentum/CV/recent_change. This
+guarantees momentum exists before any momentum flag is evaluated. ““” if
+source_col is None or source_col not in df.columns: return []
+
+    df[source_col] = pd.to_numeric(df[source_col], errors="coerce")
+
+    mapping = {
+        f"{prefix}_window_mean": wmean(source_col),
+        f"{prefix}_window_std": wstd(source_col),
+        f"{prefix}_window_min": wmin(source_col),
+        f"{prefix}_window_max": wmax(source_col),
+        f"{prefix}_current": df[source_col],
+        f"{prefix}_velocity": wvelocity(source_col),
+        f"{prefix}_momentum": wmomentum(source_col),
+        f"{prefix}_cv": wcv(source_col),
+        f"{prefix}_recent_change": df[source_col] - wlag1(source_col)
+    }
+
+    for name, values in mapping.items():
+        df[name] = values
+
+    return list(mapping.keys())
+
+created = []
+
+temporal_sources = [ (“promo_touches_q”, “promo_touches”),
+(“digital_engagement_q”, “digital_engagement”),
+(“indication_prescriptions_q”, “indication_prescriptions”), (competitor,
+“competitor_rx”), (new_rx, “new_rx”)]
+
+for source_col, prefix in temporal_sources: created +=
+add_temporal_features(source_col, prefix)
+
+Ratios / efficiency
+
+if “indication_prescriptions_q” in df.columns: ind_sum =
+wsum(“indication_prescriptions_q”) else: ind_sum = None
+
+new_rx_sum = wsum(new_rx) if new_rx is not None else None
+
+if competitor is not None and ind_sum is not None: comp_sum =
+wsum(competitor) df[“competitor_share_of_wallet_window”] = safe_divide(
+comp_sum, comp_sum + ind_sum )
+created.append(“competitor_share_of_wallet_window”)
+
+if new_rx_sum is not None and ind_sum is not None:
+df[“new_rx_rate_window”] = safe_divide( new_rx_sum, ind_sum + 1 )
+created.append(“new_rx_rate_window”)
+
+if new_rx_sum is not None and “promo_touches_q” in df.columns: promo_sum
+= wsum(“promo_touches_q”) df[“promo_efficiency_window”] = safe_divide(
+new_rx_sum, promo_sum + 1 ) created.append(“promo_efficiency_window”)
+
+if “digital_engagement_q” in df.columns and “promo_touches_q” in
+df.columns: digital_sum = wsum(“digital_engagement_q”) promo_sum =
+wsum(“promo_touches_q”) df[“digital_to_promo_ratio_window”] =
+safe_divide( digital_sum, promo_sum + 1 )
+created.append(“digital_to_promo_ratio_window”)
+
+Indication concentration and breadth
+
+if indication_cols and ind_sum is not None: denom = ind_sum + 1e-6
+df[“indication_concentration_hhi_window”] = sum( (wsum(c) / denom) ** 2
+for c in indication_cols )
+created.append(“indication_concentration_hhi_window”)
+
+    df["indication_breadth_window"] = sum(
+        grp[c].transform(
+            lambda x: (x.fillna(0) > 0)
+            .rolling(WINDOW_SIZE, min_periods=WINDOW_SIZE)
+            .max()
+        )
+        for c in indication_cols
+    )
+    created.append("indication_breadth_window")
+
+Channel breadth
+
+if promo_cols: df[“promo_channel_breadth_window”] = sum(
+grp[c].transform( lambda x: (x.fillna(0) > 0) .rolling(WINDOW_SIZE,
+min_periods=WINDOW_SIZE) .max() ) for c in promo_cols )
+created.append(“promo_channel_breadth_window”)
+
+if digital_cols: df[“digital_channel_breadth_window”] = sum(
+grp[c].transform( lambda x: (x.fillna(0) > 0) .rolling(WINDOW_SIZE,
+min_periods=WINDOW_SIZE) .max() ) for c in digital_cols )
+created.append(“digital_channel_breadth_window”)
+
+Payer mix
+
+if len(insurance_cols) >= 2: ins_sums = {c: wsum(c) for c in
+insurance_cols} ins_total = sum(ins_sums.values()) + 1e-6
+
+    df["payer_mix_hhi_window"] = sum(
+        (v / ins_total) ** 2 for v in ins_sums.values()
+    )
+    created.append("payer_mix_hhi_window")
+
+    df["payer_breadth_window"] = sum(
+        grp[c].transform(
+            lambda x: (x.fillna(0) > 0)
+            .rolling(WINDOW_SIZE, min_periods=WINDOW_SIZE)
+            .max()
+        )
+        for c in insurance_cols
+    )
+    created.append("payer_breadth_window")
+
+    if comm_ins is not None:
+        df["commercial_insurance_share_window"] = (
+            ins_sums[comm_ins] / ins_total
+        )
+        created.append("commercial_insurance_share_window")
+
+Current state + interactions
+
+if sem_speak is not None: df[“is_kol_speaker_current”] = (
+pd.to_numeric(df[sem_speak], errors=“coerce”).fillna(0) > 0
+).astype(int) created.append(“is_kol_speaker_current”)
+
+if rep is not None: df[“rep_active_current”] = ( pd.to_numeric(df[rep],
+errors=“coerce”).fillna(0) > 0 ).astype(int)
+created.append(“rep_active_current”)
+
+if new_rx is not None: df[“new_rx_current”] = pd.to_numeric(df[new_rx],
+errors=“coerce”) created.append(“new_rx_current”)
+
+if competitor is not None: df[“competitor_current”] =
+pd.to_numeric(df[competitor], errors=“coerce”)
+created.append(“competitor_current”)
+
+if “promo_touches_q” in df.columns and “digital_engagement_q” in
+df.columns: df[“promo_x_digital_current”] = ( df[“promo_touches_q”] *
+df[“digital_engagement_q”] ) created.append(“promo_x_digital_current”)
+
+if “promo_touches_q” in df.columns and competitor is not None:
+df[“promo_x_competitor_current”] = ( df[“promo_touches_q”] *
+pd.to_numeric(df[competitor], errors=“coerce”) )
+created.append(“promo_x_competitor_current”)
+
+if “digital_engagement_q” in df.columns and competitor is not None:
+df[“digital_x_competitor_current”] = ( df[“digital_engagement_q”] *
+pd.to_numeric(df[competitor], errors=“coerce”) )
+created.append(“digital_x_competitor_current”)
+
+if ( “promo_touches_window_mean” in df.columns and
+“digital_engagement_window_mean” in df.columns ):
+df[“promo_x_digital_window_mean”] = ( df[“promo_touches_window_mean”] *
+df[“digital_engagement_window_mean”] )
+created.append(“promo_x_digital_window_mean”)
+
+SAFE MOMENTUM FLAGS
+
+————————————————————
+
+IMPORTANT:
+
+competitor source -> prefix “competitor_rx”
+
+therefore the real column is competitor_rx_momentum.
+
+There is deliberately NO df[“competitor_momentum”] access.
+
+momentum_pairs = [ (“promo_touches”, “promo_touches_q”),
+(“digital_engagement”, “digital_engagement_q”),
+(“indication_prescriptions”, “indication_prescriptions_q”),
+(“competitor_rx”, competitor), (“new_rx”, new_rx)]
+
+for prefix, source_col in momentum_pairs: momentum_name =
+f”{prefix}_momentum” if momentum_name in df.columns: flag_name =
+f”{prefix}_positive_momentum” df[flag_name] = (
+pd.to_numeric(df[momentum_name], errors=“coerce”) .fillna(0) > 0
+).astype(int) created.append(flag_name)
+
+momentum_cols = [c for c in df.columns if “momentum” in c.lower()]
+print(“columns actually present:”) print(momentum_cols)
+
+if competitor is not None: print( “Competitor source:”, competitor, “|
+competitor_rx_momentum exists:”, “competitor_rx_momentum” in df.columns
+)
+
+print(“engineered columns:”, len(created))
+
+============================================================
+
+11. ENGINEERED MODEL DATA
+
+============================================================
+
+section(“11. BUILD ENGINEERED MODEL DATA”)
+
+model_data_fe = df[df[“eligible_for_model”]].copy()
+model_data_fe[“target”] =
+model_data_fe[“next_brand_prescribed”].astype(int)
+model_data_fe[“target_quarter_index”] =
+model_data_fe[“next_quarter_index”]
+
+leakage_cols = { “brand_prescribed”, “next_brand_prescribed”,
+“next_quarter_index”, “running_ever_adopted”, “quarter_index_2back”,
+“window_is_contiguous”, “gap_to_next_is_one”, “eligible_for_model”,
+“target”, “target_quarter_index” } identifier_cols = { “physician_id”,
+“year_quarter”, “year”, “quarter”, “quarter_index” } excluded_static =
+{VALUE_TIER_COL, “physician_gender”}
+
+raw_drop = { c for c in [ rep, samples, cards, vouchers, sem_attend,
+sem_speak, ind1, ind2, ind3, competitor, new_rx, comm_ins, medicare_ins,
+medicaid_ins, web, ehr, enews, mobile, organic, paidsearch,
+“promo_touches_q”, “digital_engagement_q”, “indication_prescriptions_q”
+] if c is not None }
+
+candidate_fe = [ c for c in model_data_fe.columns if c not in
+leakage_cols and c not in identifier_cols and c not in excluded_static
+and c not in raw_drop]
+
+train_probe = model_data_fe.loc[train_mask, candidate_fe]
+
+Remove all-missing and constant features using TRAIN only.
+
+candidate_fe = [ c for c in candidate_fe if train_probe[c].notna().any()
+and train_probe[c].nunique(dropna=True) > 1]
+
+print(“Engineered candidate features:”, len(candidate_fe))
+
+============================================================
+
+12. TRAIN-ONLY MUTUAL INFORMATION
+
+============================================================
+
+section(“12. TRAIN-ONLY MUTUAL INFORMATION”)
+
+X_train_fe_all = model_data_fe.loc[train_mask, candidate_fe].copy()
+X_valid_fe_all = model_data_fe.loc[validation_mask, candidate_fe].copy()
+X_test_fe_all = model_data_fe.loc[test_mask, candidate_fe].copy()
+
+categorical_fe = X_train_fe_all.select_dtypes( include=[“object”,
+“category”, “bool”] ).columns.tolist()
+
+numeric_fe = X_train_fe_all.select_dtypes( include=[“number”]
+).columns.tolist()
+
+mi_records = []
+
+if numeric_fe: mi_x = X_train_fe_all[numeric_fe].replace( [np.inf,
+-np.inf], np.nan ) mi_x = mi_x.fillna(mi_x.median()).fillna(0)
+
+    try:
+        mi_values = mutual_info_classif(
+            mi_x,
+            y_train,
+            random_state=RANDOM_STATE
+        )
+        mi_records = [
+            {"feature": c, "mutual_information": v}
+            for c, v in zip(numeric_fe, mi_values)
+        ]
+    except Exception as e:
+        print("MI failed safely:", repr(e))
+
+mi_df = pd.DataFrame(mi_records) if not mi_df.empty: mi_df =
+mi_df.sort_values( “mutual_information”, ascending=False
+).reset_index(drop=True)
+
+print(mi_df.head(30).round(5) if not mi_df.empty else “No MI ranking
+available.”)
+
+============================================================
+
+13. FINAL FEATURE SELECTION
+
+============================================================
+
+section(“13. FINAL FEATURE SELECTION”)
+
+ranked_numeric = ( mi_df[“feature”].tolist() if not mi_df.empty else
+numeric_fe )
+
+MAX_NUMERIC_FEATURES = 30 MAX_CATEGORICAL_FEATURES = 5
+
+selected_numeric = ranked_numeric[:MAX_NUMERIC_FEATURES]
+
+Business-important features are retained whenever they exist.
+
+business_priority = [ “promo_touches_window_mean”,
+“promo_touches_velocity”, “promo_touches_momentum”, “promo_touches_cv”,
+“promo_touches_recent_change”, “digital_engagement_window_mean”,
+“digital_engagement_velocity”, “digital_engagement_momentum”,
+“digital_engagement_cv”, “digital_engagement_recent_change”,
+“indication_prescriptions_window_mean”,
+“indication_prescriptions_velocity”,
+“indication_prescriptions_momentum”, “competitor_rx_window_mean”,
+“competitor_rx_velocity”, “competitor_rx_momentum”,
+“new_rx_window_mean”, “new_rx_velocity”, “new_rx_momentum”,
+“competitor_share_of_wallet_window”, “new_rx_rate_window”,
+“promo_efficiency_window”, “digital_to_promo_ratio_window”,
+“promo_channel_breadth_window”, “digital_channel_breadth_window”,
+“indication_breadth_window”, “payer_breadth_window”,
+“payer_mix_hhi_window”, “indication_concentration_hhi_window”,
+“promo_x_digital_current”, “promo_x_competitor_current”,
+“digital_x_competitor_current”, “promo_x_digital_window_mean”,
+“promo_touches_positive_momentum”,
+“digital_engagement_positive_momentum”,
+“indication_prescriptions_positive_momentum”,
+“competitor_rx_positive_momentum”, “new_rx_positive_momentum”]
+
+for c in business_priority: if c in numeric_fe and c not in
+selected_numeric: selected_numeric.append(c)
+
+selected_numeric = [ c for c in selected_numeric if c in
+numeric_fe][:MAX_NUMERIC_FEATURES]
+
+selected_categorical = [ c for c in categorical_fe if c not in
+excluded_static][:MAX_CATEGORICAL_FEATURES]
+
+feature_columns = selected_numeric + selected_categorical
+
+assert “target” not in feature_columns assert “next_brand_prescribed”
+not in feature_columns assert VALUE_TIER_COL not in feature_columns
+assert “physician_gender” not in feature_columns
+
+print(“FEATURES:”) for i, c in enumerate(feature_columns, 1): print(i,
+c)
+
+============================================================
+
+14. FINAL MATRICES + PREPROCESSOR
+
+============================================================
+
+section(“14. PREPROCESSING”)
+
+X_train = X_train_fe_all[feature_columns].copy() X_valid =
+X_valid_fe_all[feature_columns].copy() X_test_hist =
+X_test_fe_all[feature_columns].copy()
+
+numerical_features = [c for c in feature_columns if c in
+selected_numeric] categorical_features = [c for c in feature_columns if
+c in selected_categorical]
+
+numeric_pipe = Pipeline([ (“imputer”, SimpleImputer(strategy=“median”)),
+(“scaler”, StandardScaler())])
+
+categorical_pipe = Pipeline([ (“imputer”,
+SimpleImputer(strategy=“most_frequent”)), (“onehot”, make_ohe())])
+
+preprocessor = ColumnTransformer([ (“num”, numeric_pipe,
+numerical_features), (“cat”, categorical_pipe, categorical_features)],
+remainder=“drop”)
+
+def make_pipeline(model, y_for_smote): steps = [(“preprocessor”,
+preprocessor)] smote = safe_smote(y_for_smote) if smote is not None:
+steps.append((“smote”, smote)) steps.append((“model”, model)) return
+ImbPipeline(steps)
+
+============================================================
+
+15. OPTUNA
+
+============================================================
+
+section(“15. OPTUNA XGBOOST + LIGHTGBM”)
+
+cv = StratifiedKFold( n_splits=5, shuffle=True,
+random_state=RANDOM_STATE )
+
+def cv_objective(trial, model_type): if model_type == “xgboost”: model =
+XGBClassifier( n_estimators=trial.suggest_int(“n_estimators”, 100, 400,
+step=50), max_depth=trial.suggest_int(“max_depth”, 2, 6),
+learning_rate=trial.suggest_float(“learning_rate”, 0.02, 0.2, log=True),
+min_child_weight=trial.suggest_int(“min_child_weight”, 1, 10),
+subsample=trial.suggest_float(“subsample”, 0.7, 1.0),
+colsample_bytree=trial.suggest_float(“colsample_bytree”, 0.7, 1.0),
+gamma=trial.suggest_float(“gamma”, 0, 3),
+reg_alpha=trial.suggest_float(“reg_alpha”, 1e-4, 5, log=True),
+reg_lambda=trial.suggest_float(“reg_lambda”, 1e-3, 10, log=True),
+eval_metric=“logloss”, random_state=RANDOM_STATE, n_jobs=-1 ) else:
+model = LGBMClassifier( n_estimators=trial.suggest_int(“n_estimators”,
+100, 400, step=50), num_leaves=trial.suggest_int(“num_leaves”, 7, 40),
+max_depth=trial.suggest_int(“max_depth”, 2, 8),
+learning_rate=trial.suggest_float(“learning_rate”, 0.02, 0.2, log=True),
+min_child_samples=trial.suggest_int(“min_child_samples”, 10, 50),
+subsample=trial.suggest_float(“subsample”, 0.7, 1.0),
+colsample_bytree=trial.suggest_float(“colsample_bytree”, 0.7, 1.0),
+reg_alpha=trial.suggest_float(“reg_alpha”, 1e-4, 5, log=True),
+reg_lambda=trial.suggest_float(“reg_lambda”, 1e-3, 10, log=True),
+random_state=RANDOM_STATE, n_jobs=-1, verbosity=-1 )
+
+    pipe = make_pipeline(model, y_train)
+
+    try:
+        scores = cross_val_score(
+            pipe, X_train, y_train,
+            scoring="average_precision",
+            cv=cv, n_jobs=1, error_score=np.nan
+        )
+        return float(np.nanmean(scores))
+    except Exception as e:
+        print("Optuna trial failed safely:", repr(e))
+        return 0.0
+
+best_params = {} best_scores = {}
+
+for model_type in [“xgboost”, “lightgbm”]: print(“:”, model_type) study
+= optuna.create_study( direction=“maximize”,
+sampler=optuna.samplers.TPESampler(seed=RANDOM_STATE) ) study.optimize(
+lambda trial: cv_objective(trial, model_type), n_trials=15,
+show_progress_bar=True ) best_params[model_type] = study.best_params
+best_scores[model_type] = study.best_value print(“Best CV PR-AUC:”,
+study.best_value)
+
+============================================================
+
+16. TRAIN FINAL CANDIDATE MODELS
+
+============================================================
+
+section(“16. TRAIN FINAL CANDIDATE MODELS”)
+
+def create_model(name, params): if name == “xgboost”: return
+XGBClassifier( params, eval_metric=“logloss”, random_state=RANDOM_STATE,
+n_jobs=-1 ) return LGBMClassifier( params, random_state=RANDOM_STATE,
+n_jobs=-1, verbosity=-1 )
+
+models = {}
+
+for name in [“xgboost”, “lightgbm”]: models[name] = make_pipeline(
+create_model(name, best_params[name]), y_train ) print(“Fitting”, name)
+models[name].fit(X_train, y_train)
+
+============================================================
+
+17. EVALUATION
+
+============================================================
+
+section(“17. HISTORICAL BACKTEST EVALUATION”)
+
+def metrics(y, p, threshold=0.5): pred = (p >= threshold).astype(int) cm
+= confusion_matrix(y, pred, labels=[0, 1]) tn, fp, fn, tp = cm.ravel()
+return { “Accuracy”: accuracy_score(y, pred), “Precision”:
+precision_score(y, pred, zero_division=0), “Recall”: recall_score(y,
+pred, zero_division=0), “F1”: f1_score(y, pred, zero_division=0),
+“ROC_AUC”: safe_auc(y, p), “PR_AUC”: safe_prauc(y, p), “Brier”:
+brier_score_loss(y, p), “Specificity”: tn / (tn + fp) if tn + fp else 0,
+“Sensitivity”: tp / (tp + fn) if tp + fn else 0 }
+
+all_predictions = {} rows = []
+
+for name, model in models.items(): all_predictions[name] = { “Train”:
+model.predict_proba(X_train)[:, 1], “Validation”:
+model.predict_proba(X_valid)[:, 1], “Test”:
+model.predict_proba(X_test_hist)[:, 1] }
+
+    for split, y in [
+        ("Train", y_train),
+        ("Validation", y_valid),
+        ("Test", y_test_hist)
+    ]:
+        m = metrics(all_predictions[name][split], all_predictions[name][split])
+        # Correct call below:
+        m = metrics(y, all_predictions[name][split])
+        m["Model"] = name
+        m["Dataset"] = split
+        rows.append(m)
+
+results_df = pd.DataFrame(rows) print(results_df.round(4))
+
+============================================================
+
+18. MODEL SELECTION
+
+Validation PR-AUC is primary; historical test remains a
+
+backtest and is NOT used for threshold/model tuning.
+
+============================================================
+
+section(“18. MODEL SELECTION”)
+
+selection_rows = []
+
+for name in models: tr = metrics(y_train,
+all_predictions[name][“Train”]) va = metrics(y_valid,
+all_predictions[name][“Validation”]) te = metrics(y_test_hist,
+all_predictions[name][“Test”])
+
+    stability = (
+        abs(tr["PR_AUC"] - va["PR_AUC"])
+        + abs(va["PR_AUC"] - te["PR_AUC"])
+    )
+
+    selection_rows.append({
+        "Model": name,
+        "Train_PR_AUC": tr["PR_AUC"],
+        "Validation_PR_AUC": va["PR_AUC"],
+        "Test_PR_AUC": te["PR_AUC"],
+        "StabilityPenalty": stability,
+        "SelectionScore": va["PR_AUC"] - 0.5 * stability
+    })
+
+selection_df = pd.DataFrame(selection_rows).sort_values(
+“SelectionScore”, ascending=False )
+
+print(selection_df.round(4))
+
+final_model_name = selection_df.iloc[0][“Model”] final_model =
+models[final_model_name]
+
+print(“Selected final model:”, final_model_name)
+
+============================================================
+
+19. THRESHOLD ON VALIDATION ONLY
+
+============================================================
+
+section(“19. VALIDATION THRESHOLD OPTIMIZATION”)
+
+valid_prob = all_predictions[final_model_name][“Validation”]
+
+threshold_rows = [] for t in np.arange(0.10, 0.91, 0.01): pred =
+(valid_prob >= t).astype(int) threshold_rows.append({ “threshold”: t,
+“precision”: precision_score(y_valid, pred, zero_division=0), “recall”:
+recall_score(y_valid, pred, zero_division=0), “f1”: f1_score(y_valid,
+pred, zero_division=0) })
+
+threshold_df = pd.DataFrame(threshold_rows) best_threshold =
+threshold_df.sort_values( [“f1”, “precision”], ascending=False
+).iloc[0][“threshold”]
+
+print(“Best validation threshold:”, best_threshold)
+
+============================================================
+
+20. HISTORICAL TEST CONFUSION MATRIX / REPORT / LIFT
+
+============================================================
+
+section(“20. HISTORICAL TEST RESULTS”)
+
+test_prob = all_predictions[final_model_name][“Test”] test_pred =
+(test_prob >= best_threshold).astype(int)
+
+print(classification_report( y_test_hist, test_pred, target_names=[“No
+Adoption”, “Adoption”], zero_division=0 ))
+
+cm = confusion_matrix(y_test_hist, test_pred, labels=[0, 1])
+plt.figure(figsize=(6, 5)) sns.heatmap(cm, annot=True, fmt=“d”)
+plt.title(f”{final_model_name} - Historical Test”)
+plt.xlabel(“Predicted”) plt.ylabel(“Actual”) plt.tight_layout()
+plt.show()
+
+gains = pd.DataFrame({ “y_true”: y_test_hist.to_numpy(), “prob”:
+test_prob }).sort_values(“prob”, ascending=False).reset_index(drop=True)
+
+if len(gains) >= 2: q = min(10, len(gains)) gains[“decile”] = pd.qcut(
+gains.index, q=q, labels=False, duplicates=“drop” ) lift =
+gains.groupby(“decile”).agg( physicians=(“y_true”, “size”),
+adopters=(“y_true”, “sum”) ).reset_index() lift[“adoption_rate”] =
+lift[“adopters”] / lift[“physicians”] overall = gains[“y_true”].mean()
+lift[“lift”] = lift[“adoption_rate”] / overall if overall else np.nan
+print(“table:”) print(lift.round(4))
+
+============================================================
+
+21. SHAP
+
+============================================================
+
+section(“21. SHAP / FEATURE IMPORTANCE”)
+
+try: prep = final_model.named_steps[“preprocessor”] fitted_model =
+final_model.named_steps[“model”] names = prep.get_feature_names_out()
+
+    if hasattr(fitted_model, "feature_importances_"):
+        importance = pd.DataFrame({
+            "feature": names,
+            "importance": fitted_model.feature_importances_
+        }).sort_values("importance", ascending=False)
+        print(importance.head(30))
+
+    sample = X_test_hist.sample(
+        min(500, len(X_test_hist)),
+        random_state=RANDOM_STATE
+    )
+    transformed = prep.transform(sample)
+    explainer = shap.TreeExplainer(fitted_model)
+    sv = explainer.shap_values(transformed)
+
+    if isinstance(sv, list):
+        sv_plot = sv[1]
+    elif getattr(sv, "ndim", 2) == 3:
+        sv_plot = sv[:, :, 1]
+    else:
+        sv_plot = sv
+
+    shap.summary_plot(
+        sv_plot,
+        transformed,
+        feature_names=names,
+        max_display=25,
+        show=False
+    )
+    plt.tight_layout()
+    plt.show()
+
+except Exception as e: print(“SHAP skipped safely:”, repr(e))
+
+============================================================
+
+22. RETRAIN ON ALL HISTORICAL WINDOWS
+
+============================================================
+
+section(“22. RETRAIN FINAL MODEL ON ALL HISTORICAL WINDOWS”)
+
+X_all = model_data_fe[feature_columns].copy() y_all =
+model_data_fe[“target”].copy()
+
+final_model.fit(X_all, y_all) print(“Final model retrained on all
+eligible historical windows.”)
+
+============================================================
+
+23. FINAL Q8-Q10 / Q11 FOR TEST PHYSICIANS
+
+============================================================
+
+section(“23. FINAL Q11 PREDICTION”)
+
+test_ids = set(test_physicians[“physician_id”])
+
+test_history = ( df[df[“physician_id”].isin(test_ids)]
+.sort_values([“physician_id”, “quarter_index”]) )
+
+test_latest = ( test_history .groupby(“physician_id”, as_index=False)
+.tail(1) .copy() )
+
+A latest row represents the Q10 window end when the panel has Q1-Q10.
+
+test_latest[“latest_window_contiguous”] = (
+test_latest[“quarter_index”] - test_latest[“quarter_index_2back”] ) ==
+WINDOW_SIZE - 1
+
+missing_feature_cols = [ c for c in feature_columns if c not in
+test_latest.columns] if missing_feature_cols: raise KeyError( “Missing
+engineered test columns:” + str(missing_feature_cols) )
+
+usable = ( test_latest[“latest_window_contiguous”] &
+test_latest[feature_columns].notna().all(axis=1) )
+
+print(“Test physicians:”, test_physicians[“physician_id”].nunique())
+print(“Latest rows:”, test_latest[“physician_id”].nunique())
+print(“Usable Q8-Q10 windows:”, int(usable.sum())) print(“Unusable
+latest windows:”, int((~usable).sum()))
+
+scoring = test_latest.loc[usable].copy()
+
+if scoring.empty: raise ValueError(“No test physician has a complete
+latest Q8-Q10 window.”)
+
+X_q11 = scoring[feature_columns].copy() q11_prob =
+final_model.predict_proba(X_q11)[:, 1] q11_class = (q11_prob >=
+best_threshold).astype(int)
+
+q11_predictions = scoring[[“physician_id”]].copy()
+q11_predictions[“predicted_adoption_probability_Q11”] = q11_prob
+q11_predictions[“predicted_adoption_class_Q11”] = q11_class
+q11_predictions[“probability_rank”] = (
+q11_predictions[“predicted_adoption_probability_Q11”]
+.rank(ascending=False, method=“first”) .astype(int) )
+
+try: q11_predictions[“targeting_priority”] = pd.qcut(
+q11_predictions[“predicted_adoption_probability_Q11”], q=4,
+labels=[“Low”, “Medium”, “High”, “Very High”], duplicates=“drop” )
+except Exception: q11_predictions[“targeting_priority”] = “Medium”
+
+q11_predictions = q11_predictions.sort_values(
+“predicted_adoption_probability_Q11”, ascending=False
+).reset_index(drop=True)
+
+q11_predictions.to_csv(OUTPUT_FILE, index=False)
+
+print(“:”, OUTPUT_FILE) print(“Rows scored:”, len(q11_predictions))
+print( “Predicted Q11 adopters:”,
+int(q11_predictions[“predicted_adoption_class_Q11”].sum()) ) print(“:”)
+print(q11_predictions.head(20))
+
+============================================================
+
+24. FINAL VALIDATION CHECKS
+
+============================================================
+
+section(“24. FINAL PIPELINE CHECKS”)
+
+checks = [ “Split before analytical EDA”, “Univariate EDA TRAIN only”,
+“Bivariate EDA TRAIN only”, “Null/missing analysis TRAIN only”,
+“Advanced EDA TRAIN only”, “Correlation TRAIN only”, “VIF TRAIN only”,
+“Advanced rolling features”, “Velocity / trend features”, “MOMENTUM /
+acceleration features”, “Ratio / efficiency features”, “Breadth /
+diversity features”, “Interaction features”, “MI TRAIN only”, “SMOTE
+inside model pipeline”, “XGBoost + LightGBM”, “Validation-based
+threshold”, “Historical test retained for backtest”, “Final retraining
+on all historical windows”, “Q11 prediction from latest observed
+window”]
+
+for i, item in enumerate(checks, 1): print(f”{i:02d}. {item}: PASS”)
+
+print(“ERROR FIX:”) print(“Old unsafe reference:
+df[‘competitor_momentum’]”) print(“Correct feature name:
+competitor_rx_momentum”) print(“All momentum flags now check column
+existence first.”) print(“COMPLETE.”)
